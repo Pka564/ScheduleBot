@@ -194,15 +194,18 @@ it('снимает claim после отказа 429 и повторяет то�
   } finally { mock.restore() }
 })
 
-it('хранит claim при неизвестном результате отправки и сообщает об ошибке без исходного исключения', async () => {
-  const mock = fakeTelegram(() => { throw new Error('private-fetch-url') })
+it.each([
+  ['transport', new Error('private-fetch-url'), 180],
+  ['type_error', new TypeError('private-fetch-url'), 181],
+] as const)('хранит claim и диагностирует %s без исходного исключения', async (reason, error, id) => {
+  const mock = fakeTelegram(() => { throw error })
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
   try {
-    expect(await (await command(180, 81010, '/id')).json()).toEqual({ ok: false })
-    expect(await (await command(180, 81010, '/id')).json()).toEqual({ ok: true, duplicate: true })
+    expect(await (await command(id, 81010, '/id')).json()).toEqual({ ok: false })
+    expect(await (await command(id, 81010, '/id')).json()).toEqual({ ok: true, duplicate: true })
     expect(mock.send).toHaveBeenCalledTimes(1)
     const diagnostic = JSON.stringify(warn.mock.calls)
-    expect(diagnostic).toContain('transport')
+    expect(diagnostic).toContain(reason)
     expect(diagnostic).not.toContain('private-fetch-url')
   } finally { mock.restore(); warn.mockRestore() }
 })

@@ -4,7 +4,9 @@ import { equal, getDraft, HttpError, isAdmin, jsonBody, publish, schedule, summa
 
 export const uploadLimit = 5 * 1024 * 1024
 type BotMethod = 'sendMessage' | 'answerCallbackQuery' | 'getFile'
-type TelegramFailure = 'configuration' | 'transport' | 'invalid_response' | 'rejected'
+type TelegramOperation = BotMethod | 'downloadFile'
+type TransportFailure = 'timeout' | 'aborted' | 'network' | 'type_error'
+type TelegramFailure = TransportFailure | 'configuration' | 'transport' | 'redirect' | 'http_error' | 'invalid_response' | 'rejected'
 interface Trace { id: string; apiAttempted: boolean }
 const newTrace = (): Trace => ({ id: crypto.randomUUID(), apiAttempted: false })
 function log(trace: Trace, event: string, fields: Record<string, string | number> = {}, level: 'info' | 'warn' = 'info') {
@@ -17,35 +19,54 @@ export class TelegramError extends Error {
   }
 }
 const validBotToken = (token?: string) => /^\d+:[A-Za-z0-9_-]+$/.test(token?.trim() ?? '')
-export async function telegram<T = unknown>(env: Env, method: BotMethod, payload: object, trace = newTrace()): Promise<T> {
-  function failure(reason: TelegramFailure, code: number, retryAfter = 0) {
-    log(trace, 'api_failure', { method, reason, code }, 'warn')
-    return new TelegramError(code, retryAfter, reason)
-  }
-  if (!validBotToken(env.BOT_TOKEN)) throw failure('configuration', 503)
-  const token = env.BOT_TOKEN!.trim()
+function failure(trace: Trace, method: TelegramOperation, reason: TelegramFailure, code: number, retryAfter = 0) {
+  log(trace, 'api_failure', { method, reason, code }, 'warn')
+  return new TelegramError(code, retryAfter, reason)
+}
+function transportFailure(error: unknown): TransportFailure | undefined {
+  if (!(error instanceof Error || error instanceof DOMException)) return
+  if (error.name === 'TimeoutError') return 'timeout'
+  if (error.name === 'AbortError') return 'aborted'
+  // Workerd also reports connection failures as plain Errors. Inspect details only for classification.
+  if (error.name === 'NetworkError' ||
+      /network (?:connection lost|is unreachable)|connection (?:refused|reset)|dns (?:lookup|resolution)|failed to resolve/i.test(error.message)) return 'network'
+  if (error instanceof TypeError) return 'type_error'
+}
+async function telegramFetch(url: string, method: TelegramOperation, trace: Trace,
+  init: Pick<RequestInit, 'method' | 'headers' | 'body'> = {}, timeout = 10000,
+) {
   log(trace, 'api_request', { method })
   trace.apiAttempted = true
   let response: Response
   try {
-    response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
-      redirect: 'error', signal: AbortSignal.timeout(10000),
-    })
-  } catch {
-    throw failure('transport', 503)
+    response = await fetch(url, { ...init, redirect: 'manual', signal: AbortSignal.timeout(timeout) })
+  } catch (error) {
+    throw failure(trace, method, transportFailure(error) ?? 'transport', 503)
   }
+  // Workerd supports manual redirects. Never follow them with the bot token in the URL.
+  if (response.status >= 300 && response.status < 400)
+    throw failure(trace, method, 'redirect', response.status)
+  return response
+}
+export async function telegram<T = unknown>(env: Env, method: BotMethod, payload: object, trace = newTrace()): Promise<T> {
+  if (!validBotToken(env.BOT_TOKEN)) throw failure(trace, method, 'configuration', 503)
+  const response = await telegramFetch(`https://api.telegram.org/bot${env.BOT_TOKEN!.trim()}/${method}`, method, trace, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  })
   let result: { ok: boolean; result: T; error_code?: number; parameters?: { retry_after?: number } } | null
   try { result = await response.json() as typeof result }
-  catch { throw failure('invalid_response', response.status) }
+  catch (error) {
+    const reason = transportFailure(error)
+    throw failure(trace, method, reason ?? 'invalid_response', reason ? 503 : response.status)
+  }
   if (result?.ok === false) {
     const code = typeof result.error_code === 'number' && Number.isInteger(result.error_code) &&
       result.error_code >= 400 && result.error_code <= 599 ? result.error_code : response.status
     const seconds = result.parameters?.retry_after
     const retryAfter = typeof seconds === 'number' && Number.isInteger(seconds) && seconds > 0 && seconds <= 86400 ? seconds : 0
-    throw failure('rejected', code, retryAfter)
+    throw failure(trace, method, 'rejected', code, retryAfter)
   }
-  if (!response.ok || result?.ok !== true || !('result' in result)) throw failure('invalid_response', response.status)
+  if (!response.ok || result?.ok !== true || !('result' in result)) throw failure(trace, method, 'invalid_response', response.status)
   log(trace, 'api_success', { method })
   return result.result
 }
@@ -106,12 +127,14 @@ export async function workbookFile(env: Env, owner: string, id: string) {
   const file = await env.DB.prepare('SELECT file_id FROM telegram_files WHERE id=? AND owner=? AND created>?')
     .bind(id, owner, Date.now() - ttl).first<string>('file_id')
   if (!file) throw new HttpError(404, 'Файл не найден или ссылка устарела')
+  const trace = newTrace()
   try {
-    const result = await telegram<{ file_path: string; file_size?: number }>(env, 'getFile', { file_id: file })
-    if (!/^[\w./-]+$/.test(result.file_path) || result.file_path.includes('..') || (result.file_size ?? 0) > uploadLimit)
+    const result = await telegram<{ file_path: string; file_size?: number }>(env, 'getFile', { file_id: file }, trace)
+    if (typeof result?.file_path !== 'string' || !/^[\w./-]+$/.test(result.file_path) ||
+        result.file_path.includes('..') || (result.file_size ?? 0) > uploadLimit)
       throw new HttpError(400, 'Файл недоступен или превышает 5 МиБ')
-    const upstream = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN!.trim()}/${result.file_path}`, { redirect: 'error' })
-    if (!upstream.ok || !upstream.body) throw new Error()
+    const upstream = await telegramFetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN!.trim()}/${result.file_path}`, 'downloadFile', trace, {}, 30000)
+    if (!upstream.ok || !upstream.body) throw failure(trace, 'downloadFile', 'http_error', upstream.status)
     if (Number(upstream.headers.get('content-length')) > uploadLimit) throw new HttpError(413, 'Файл слишком большой')
     let size = 0
     const body = upstream.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
@@ -121,6 +144,7 @@ export async function workbookFile(env: Env, owner: string, id: string) {
         else controller.enqueue(chunk)
       },
     }))
+    log(trace, 'api_success', { method: 'downloadFile' })
     return new Response(body, { headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' } })
   } catch (err) {
     if (err instanceof HttpError) throw err

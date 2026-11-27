@@ -52,9 +52,10 @@ export async function processNotifications(env: Env, now: number) {
     try {
       await send(env, job.user_id, job.message)
     } catch (err) {
-      if (err instanceof TelegramError && err.code === 403)
+      if (!(err instanceof TelegramError) || err.reason !== 'rejected') continue
+      if (err.code === 403)
         await db.prepare('UPDATE users SET blocked=1 WHERE id=?').bind(job.user_id).run()
-      if (err instanceof TelegramError && err.code === 429) {
+      if (err.code === 429) {
         await db.prepare("UPDATE notification_jobs SET state='pending',due=? WHERE user_id=? AND event=?")
           .bind(now + Math.max(1, err.retryAfter) * 1000, job.user_id, job.event).run()
         break
