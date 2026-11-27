@@ -1,0 +1,16 @@
+name = "schedulebot"
+main = "src/worker/index.ts"
+compatibility_date = "2026-08-01"
+workers_dev = true
+
+[vars]
+MINI_APP_URL = "https://pka564.github.io/ScheduleBot/"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "schedulebot"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["*/5 * * * *"]
