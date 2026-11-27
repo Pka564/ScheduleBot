@@ -35,7 +35,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
   const adminRoute = path.startsWith('/api/admin/')
   if (adminRoute || path === '/api/settings') {
     await rateLimit(db, `protected:${ip}`, 45)
-    const id = await telegramUser(request.headers.get('Authorization')?.replace(/^tma /, '') ?? '', env.BOT_TOKEN)
+    const id = await telegramUser(request.headers.get('Authorization')?.replace(/^tma /, '') ?? '', env.BOT_TOKEN?.trim())
     if (path === '/api/settings') return settings(env, id, request)
     if (!isAdmin(env, id)) throw new HttpError(403, 'Доступ только для администратора')
     const action = path.slice(11)
@@ -49,7 +49,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
     }
     if (action === 'drafts' && method === 'POST') {
       const draft = await saveDraft(db, id, await jsonBody(request))
-      ctx.waitUntil(postDraft(env, id, draft).catch(() => undefined))
+      ctx.waitUntil(postDraft(env, id, draft))
       return json(draft, 201)
     }
     if (action === 'groups' && method === 'POST') {
