@@ -1,0 +1,4 @@
+# Copy to .dev.vars only for local testing in Telegram; values below are placeholders.
+BOT_TOKEN=replace_me
+ADMIN_TELEGRAM_IDS=12345678
+TELEGRAM_WEBHOOK_SECRET=replace_me
